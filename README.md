@@ -44,10 +44,7 @@ Aplikasi WhatsApp chatbot terintegrasi yang menggabungkan layanan WhatsApp dan L
 3. **Jalankan aplikasi:**
    ```bash
    # Development mode
-   npm run dev
-   
-   # Production mode
-   npm start
+   node index.js
    ```
 
 4. **Scan QR code di terminal untuk menghubungkan WhatsApp**
