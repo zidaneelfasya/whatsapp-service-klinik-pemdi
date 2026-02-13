@@ -184,15 +184,8 @@ if (process.env.AUTO_INIT_WHATSAPP === 'true') {
 	console.log("⏸️ WhatsApp Client ready for manual initialization via /initialize endpoint");
 	console.log("💡 Use POST /initialize to start WhatsApp connection");
 }
+// Simple conversation tracking (optional, untuk fitur lanjutan seperti context memory)
 const userSessions = new Map();
-
-// Chat status constants
-const CHAT_STATUS = {
-	INACTIVE: "inactive",
-	WAITING_COMMAND: "waiting_command",
-	ACTIVE: "active",
-	WAITING_FEEDBACK: "waiting_feedback",
-};
 
 // Fungsi untuk cek apakah nomor diotorisasi
 function isAuthorizedUser(phoneNumber) {
@@ -227,7 +220,102 @@ function isAuthorizedUser(phoneNumber) {
 	return isAuthorized;
 }
 
-// Fungsi untuk mendapatkan konteks dari RAG service
+// ========================================
+// CLASSIFIER: Menentukan apakah perlu RAG atau tidak
+// ========================================
+function needsRAG(message) {
+	const lowerMessage = message.toLowerCase().trim();
+
+	// 1. Sapaan umum - TIDAK PERLU RAG
+	const greetings = [
+		'halo', 'hai', 'hello', 'hi', 'hey',
+		'selamat pagi', 'selamat siang', 'selamat sore', 'selamat malam',
+		'assalamualaikum', 'salam'
+	];
+	if (greetings.some(greeting => lowerMessage === greeting || lowerMessage.startsWith(greeting + ' '))) {
+		return false;
+	}
+
+	// 2. Pertanyaan tentang chatbot - TIDAK PERLU RAG
+	const aboutBotKeywords = [
+		'ini chatbot', 'chatbot ini', 'bot ini', 'kamu siapa',
+		'siapa kamu', 'kamu bot', 'apa fungsi', 'bisa apa',
+		'bagaimana cara', 'cara menggunakan', 'cara pakai'
+	];
+	if (aboutBotKeywords.some(keyword => lowerMessage.includes(keyword))) {
+		return false;
+	}
+
+	// 3. Small talk - TIDAK PERLU RAG
+	const smallTalkKeywords = [
+		'apa kabar', 'kabar', 'gimana kabar',
+		'terima kasih', 'makasih', 'thanks', 'thank you',
+		'ok', 'oke', 'baik', 'siap'
+	];
+	if (smallTalkKeywords.some(keyword => lowerMessage === keyword || lowerMessage.includes(keyword))) {
+		const shortMessages = ['ok', 'oke', 'baik', 'siap', 'ya', 'tidak'];
+		if (shortMessages.includes(lowerMessage)) {
+			return false;
+		}
+	}
+
+	// 4. Jika pesan sangat pendek (1-2 kata) dan bukan pertanyaan - TIDAK PERLU RAG
+	const words = lowerMessage.split(' ').filter(w => w.length > 0);
+	if (words.length <= 2 && !lowerMessage.includes('?')) {
+		return false;
+	}
+
+	// 5. Default: Gunakan RAG untuk pertanyaan lainnya
+	return true;
+}
+
+// ========================================
+// RESPONSE WITHOUT RAG: Jawaban natural tanpa RAG
+// ========================================
+async function generateSimpleResponse(message) {
+	try {
+		const lowerMessage = message.toLowerCase().trim();
+
+		// Deteksi jenis pesan dan beri respons yang sesuai
+		let systemPrompt = "";
+
+		// Sapaan
+		const greetings = ['halo', 'hai', 'hello', 'hi', 'hey', 'selamat pagi', 'selamat siang', 'selamat sore', 'selamat malam', 'assalamualaikum', 'salam'];
+		if (greetings.some(greeting => lowerMessage.startsWith(greeting))) {
+			systemPrompt = `Kamu adalah asisten ramah Klinik PEMDI. User menyapa kamu dengan "${message}". Balas sapaan dengan hangat dan tawarkan bantuan secara natural. Maksimal 2-3 kalimat. Gunakan 1 emoji yang sesuai. Jangan sebutkan bahwa kamu adalah AI atau bot.`;
+		}
+		// Pertanyaan tentang chatbot
+		else if (lowerMessage.includes('chatbot') || lowerMessage.includes('kamu siapa') || lowerMessage.includes('siapa kamu') || lowerMessage.includes('bot')) {
+			systemPrompt = `Kamu adalah asisten Klinik PEMDI yang membantu menjawab pertanyaan seputar layanan klinik. User bertanya "${message}". Jelaskan bahwa kamu siap membantu dengan informasi seputar Klinik PEMDI. Maksimal 3 kalimat. Gunakan 1 emoji. Jangan sebut kata AI, bot, atau teknologi sistem.`;
+		}
+		// Small talk
+		else if (lowerMessage.includes('apa kabar') || lowerMessage.includes('kabar')) {
+			systemPrompt = `User bertanya "${message}". Jawab dengan ramah dan tanyakan balik bagaimana kamu bisa membantu. Maksimal 2 kalimat. Gunakan 1 emoji. Santai dan natural.`;
+		}
+		// Terima kasih
+		else if (lowerMessage.includes('terima kasih') || lowerMessage.includes('makasih') || lowerMessage.includes('thanks')) {
+			systemPrompt = `User mengucapkan "${message}". Jawab dengan ramah bahwa kamu senang bisa membantu dan siap membantu lagi. Maksimal 2 kalimat. Gunakan 1 emoji.`;
+		}
+		// Default untuk pesan pendek lainnya
+		else {
+			systemPrompt = `Kamu adalah asisten Klinik PEMDI. User mengirim pesan "${message}". Jawab dengan ramah dan tawarkan bantuan jika mereka punya pertanyaan seputar Klinik PEMDI. Maksimal 2-3 kalimat. Gunakan 1 emoji. Santai dan natural.`;
+		}
+
+		const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+		const result = await model.generateContent([systemPrompt]);
+		const response = await result.response;
+
+		return response.text();
+	} catch (error) {
+		console.error("❌ Error generating simple response:", error.message);
+		// Fallback response
+		return "Halo! Ada yang bisa saya bantu? 😊";
+	}
+}
+
+// ========================================
+// RAG SERVICE: Mendapatkan konteks dari RAG
+// ========================================
 async function getContextFromRAG(message) {
 	try {
 		const response = await axios.post(
@@ -243,21 +331,42 @@ async function getContextFromRAG(message) {
 	}
 }
 
-// Fungsi untuk generate response menggunakan Gemini
-async function generateResponse(message, contextualChunks) {
+// ========================================
+// RESPONSE WITH RAG: Generate response menggunakan Gemini + RAG
+// ========================================
+async function generateResponseWithRAG(message, contextualChunks) {
 	try {
+		// Jika tidak ada konteks dari RAG
+		if (!contextualChunks || contextualChunks.length === 0) {
+			const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+			const fallbackPrompt = `Kamu adalah asisten ramah Klinik PEMDI. User bertanya "${message}" tapi kamu tidak memiliki informasi spesifik tentang itu. Jawab dengan sopan bahwa informasi tersebut belum tersedia dan tawarkan bantuan untuk pertanyaan lain. Maksimal 3 kalimat. Gunakan 1 emoji. Jangan sebut kata "sistem", "database", atau "RAG".`;
+			const result = await model.generateContent([fallbackPrompt]);
+			const response = await result.response;
+			return response.text();
+		}
+
 		const combinedContext = contextualChunks.join("\n\n---\n\n");
 
-		const prompt = `Kamu adalah asisten cerdas yang menjawab pertanyaan hanya berdasarkan informasi yang diberikan dari dokumen internal. berikan jawaban profesional yang panjang. Jika jawabannya tidak ditemukan di dokumen, katakan dengan jujur bahwa kamu tidak tahu atau informasinya tidak tersedia.
+		const prompt = `Kamu adalah asisten ramah Klinik PEMDI yang membantu menjawab pertanyaan pengguna.
 
-=== Informasi Konteks ===
+**ATURAN PENTING:**
+1. Jawab dengan gaya NATURAL dan RAMAH seperti customer service yang berpengalaman
+2. Gunakan informasi dari konteks di bawah untuk menjawab
+3. Jika informasi tidak ada di konteks, katakan dengan jujur tapi tetap sopan
+4. Maksimal 5-6 kalimat (kecuali perlu penjelasan detail)
+5. Boleh gunakan 1-2 emoji yang sesuai
+6. JANGAN sebut: "berdasarkan dokumen", "sistem internal", "database", "RAG", "AI", "model bahasa"
+7. Gunakan kata ganti "kami" atau "Klinik PEMDI" untuk merujuk layanan
+8. Bahasa Indonesia yang santai tapi profesional
+
+=== Informasi yang Tersedia ===
 ${combinedContext}
-=======================
+================================
 
-Pertanyaan:
+Pertanyaan User:
 ${message}
 
-Berdasarkan informasi konteks di atas, jawablah pertanyaan dengan jelas dan detail:`;
+Jawab dengan natural dan membantu:`;
 
 		const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 		const result = await model.generateContent([prompt]);
@@ -265,237 +374,96 @@ Berdasarkan informasi konteks di atas, jawablah pertanyaan dengan jelas dan deta
 
 		return response.text();
 	} catch (error) {
-		console.error("❌ Error generating response:", error.message);
+		console.error("❌ Error generating response with RAG:", error.message);
 		throw error;
 	}
 }
 
-// Handler pesan WhatsApp
+// ========================================
+// HANDLER PESAN WHATSAPP - INTERACTIVE & NATURAL
+// ========================================
 client.on("message", async (msg) => {
 	const incomingText = msg.body.trim();
 	const sender = msg.from;
 
 	console.log(`📩 Pesan masuk dari ${sender}: ${incomingText}`);
 
-	// 🔐 AUTHORIZATION CHECK - Cek apakah user diotorisasi
+	// 🔐 AUTHORIZATION CHECK
 	if (!isAuthorizedUser(sender)) {
 		console.log(
 			`🚫 Akses ditolak untuk ${sender} - Tidak dalam daftar authorized users`
 		);
-		// Tidak mengirim balasan apapun, hanya log dan return
 		return;
 	}
 
-	// Get atau create user session
-	if (!userSessions.has(sender)) {
-		userSessions.set(sender, { status: CHAT_STATUS.INACTIVE });
+	// Abaikan pesan grup dan pesan dari bot sendiri
+	if (msg.from.includes('@g.us')) {
+		console.log(`⚪ Pesan grup diabaikan dari ${sender}`);
+		return;
 	}
 
-	const userSession = userSessions.get(sender);
+	// Abaikan pesan yang terlalu panjang (kemungkinan spam)
+	if (incomingText.length > 1000) {
+		console.log(`⚠️ Pesan terlalu panjang dari ${sender}`);
+		await msg.reply("Maaf, pesan Anda terlalu panjang. Bisa dipersingkat? 😊");
+		return;
+	}
 
 	try {
-		// 🚀 TRIGGER CHECK - Cek apakah pesan adalah trigger untuk memulai chatbot
-		if (userSession.status === CHAT_STATUS.INACTIVE) {
-			// Hanya aktifkan chatbot jika pesan adalah "/klinik_pemdi"
-			if (incomingText.toLowerCase() === "/klinik_pemdi") {
-				userSession.status = CHAT_STATUS.WAITING_COMMAND;
-				userSessions.set(sender, userSession);
+		// ========================================
+		// DECISION: Apakah perlu RAG atau tidak?
+		// ========================================
+		const shouldUseRAG = needsRAG(incomingText);
 
-				// Kirim pesan selamat datang dengan pilihan
-				const menuMessage = `Selamat datang di layanan chatbot Klinik PEMDI! 👋
+		let reply;
 
-Silakan pilih salah satu opsi berikut dengan mengetik angka atau teks:
-
-1️⃣ *Bertanya tentang Klinik PEMDI* (ketik: 1 atau tanya)
-2️⃣ *Tidak Memerlukan Layanan* (ketik: 2 atau tidak)
-
-Contoh: ketik "1" untuk mulai bertanya`;
-
-				await client.sendMessage(sender, menuMessage);
-				console.log(
-					`🔔 Chatbot diaktifkan untuk ${sender} dengan trigger /klinik_pemdi`
-				);
-				return;
-			} else {
-				// Jika bukan trigger command, abaikan pesan
-				console.log(
-					`⚪ Pesan diabaikan dari ${sender} - Bukan trigger command /klinik_pemdi`
-				);
-				return;
-			}
+		if (shouldUseRAG) {
+			// ========================================
+			// PATH 1: Pertanyaan DENGAN RAG
+			// ========================================
+			console.log(`🔍 Menggunakan RAG untuk pertanyaan dari ${sender}`);
+			
+			// Dapatkan konteks dari RAG
+			const contextualChunks = await getContextFromRAG(incomingText);
+			
+			// Generate response dengan RAG
+			reply = await generateResponseWithRAG(incomingText, contextualChunks);
+		} else {
+			// ========================================
+			// PATH 2: Pertanyaan TANPA RAG
+			// ========================================
+			console.log(`💬 Menggunakan respons natural (tanpa RAG) untuk ${sender}`);
+			
+			// Generate response natural tanpa RAG
+			reply = await generateSimpleResponse(incomingText);
 		}
 
-		// 1. Handle command untuk mengaktifkan chatbot (setelah trigger)
-		if (userSession.status === CHAT_STATUS.WAITING_COMMAND) {
-			const lowerText = incomingText.toLowerCase();
+		// Kirim balasan
+		await msg.reply(reply);
+		console.log(`✅ Balasan terkirim ke ${sender}`);
 
-			// Handle pilihan 1: Bertanya tentang Klinik PEMDI
-			if (
-				lowerText === "1" ||
-				lowerText === "tanya" ||
-				lowerText.includes("tanya")
-			) {
-				userSession.status = CHAT_STATUS.ACTIVE;
-				userSessions.set(sender, userSession);
-
-				await msg.reply(
-					"Silakan bertanya tentang kebutuhan Anda terkait Klinik PEMDI. Saya siap membantu! 😊"
-				);
-				console.log(`✅ Chatbot diaktifkan untuk ${sender} - mode tanya`);
-				return;
-			}
-			// Handle pilihan 2: Tidak Memerlukan Layanan
-			else if (
-				lowerText === "2" ||
-				lowerText === "tidak" ||
-				lowerText.includes("tidak")
-			) {
-				// Jika user memilih tidak memerlukan layanan
-				await msg.reply("Terima kasih telah menggunakan layanan kami! 🙏");
-
-				userSession.status = CHAT_STATUS.INACTIVE;
-				userSessions.set(sender, userSession);
-
-				console.log(
-					`👋 Session berakhir untuk ${sender} - User tidak menggunakan layanan`
-				);
-				return;
-			} else {
-				// Jika user mengetik selain pilihan yang valid, kirim ulang menu
-				const menuMessage = `Mohon pilih salah satu opsi yang tersedia:
-
-1️⃣ *Bertanya tentang Klinik PEMDI* (ketik: 1 atau tanya)
-2️⃣ *Tidak Memerlukan Layanan* (ketik: 2 atau tidak)
-
-Contoh: ketik "1" untuk mulai bertanya`;
-
-				await client.sendMessage(sender, menuMessage);
-				console.log(`🔄 Menu pilihan dikirim ulang ke ${sender}`);
-				return;
-			}
+		// Optional: Track conversation (untuk fitur lanjutan seperti context memory)
+		if (!userSessions.has(sender)) {
+			userSessions.set(sender, { messageCount: 0, lastMessageTime: Date.now() });
 		}
+		const session = userSessions.get(sender);
+		session.messageCount++;
+		session.lastMessageTime = Date.now();
+		userSessions.set(sender, session);
 
-		// 2. Handle feedback response
-		if (userSession.status === CHAT_STATUS.WAITING_FEEDBACK) {
-			const lowerText = incomingText.toLowerCase();
-
-			// Cek respons negatif TERLEBIH DAHULU
-			if (
-				lowerText.includes("tidak puas") ||
-				lowerText.includes("tidak") ||
-				lowerText.includes("kurang") ||
-				lowerText === "2" ||
-				lowerText === "no" ||
-				lowerText === "n"
-			) {
-				await msg.reply(
-					"Mohon maaf atas ketidakpuasan Anda. Silakan isi feedback di Google Form: https://aws.amazon.com/id/what-is/retrieval-augmented-generation"
-				);
-
-				// Reset session - chatbot berakhir
-				userSession.status = CHAT_STATUS.INACTIVE;
-				userSessions.set(sender, userSession);
-
-				console.log(`✅ Session berakhir untuk ${sender} - User tidak puas`);
-				return;
-			}
-			// Baru cek respons positif
-			else if (
-				lowerText.includes("ya, puas") ||
-				lowerText === "ya" ||
-				lowerText === "puas" ||
-				lowerText === "1" ||
-				lowerText === "yes" ||
-				lowerText === "y"
-			) {
-				await msg.reply(
-					"Terima kasih telah menggunakan layanan chatbot klinik pemdi"
-				);
-
-				// Reset session - chatbot berakhir
-				userSession.status = CHAT_STATUS.INACTIVE;
-				userSessions.set(sender, userSession);
-
-				console.log(`✅ Session berakhir untuk ${sender} - User puas`);
-				return;
-			} else {
-				// Jika user mengirim pesan lain saat waiting feedback, ingatkan
-				const feedbackMessage = `Silakan pilih salah satu opsi feedback yang tersedia:
-
-1️⃣ *Ya, puas* (ketik: ya atau 1)
-2️⃣ *Tidak puas* (ketik: tidak atau 2)
-
-Silakan berikan feedback Anda`;
-
-				await client.sendMessage(sender, feedbackMessage);
-				return;
-			}
-		}
-
-		// 3. Handle pertanyaan chatbot (hanya jika status ACTIVE)
-		if (userSession.status === CHAT_STATUS.ACTIVE) {
-			try {
-				// Dapatkan konteks dari RAG
-				const contextualChunks = await getContextFromRAG(incomingText);
-
-				// Generate response menggunakan Gemini
-				const reply = await generateResponse(incomingText, contextualChunks);
-
-				// Kirim balasan utama
-				await msg.reply(reply);
-
-				// Kirim feedback menggunakan pesan teks
-				const feedbackMessage = `Apakah anda puas dengan jawabannya?
-
-1️⃣ *Ya, puas* (ketik: ya atau 1)
-2️⃣ *Tidak puas* (ketik: tidak atau 2)
-
-Silakan pilih salah satu opsi di atas`;
-
-				await client.sendMessage(sender, feedbackMessage);
-
-				// Update status ke waiting feedback
-				userSession.status = CHAT_STATUS.WAITING_FEEDBACK;
-				userSessions.set(sender, userSession);
-
-				console.log(`✅ Balasan terkirim ke ${sender}, menunggu feedback`);
-				return;
-			} catch (error) {
-				console.error(
-					`❌ Error saat memproses pertanyaan dari ${sender}:`,
-					error.message
-				);
-				await msg.reply(
-					"Maaf, terjadi kesalahan saat memproses pertanyaan Anda. Silakan coba lagi."
-				);
-
-				userSession.status = CHAT_STATUS.INACTIVE;
-				userSessions.set(sender, userSession);
-				return;
-			}
-		}
-
-		// 4. Jika chatbot tidak aktif dan bukan pemicu, abaikan pesan
-		if (userSession.status === CHAT_STATUS.INACTIVE) {
-			console.log(`⚪ Pesan diabaikan dari ${sender} - Chatbot tidak aktif`);
-			return;
-		}
 	} catch (err) {
-		console.error(`❌ Gagal memproses pesan dari ${sender}`, err.message);
-
-		// Reset session jika terjadi error
-		userSession.status = CHAT_STATUS.INACTIVE;
-		userSessions.set(sender, userSession);
-
+		console.error(`❌ Gagal memproses pesan dari ${sender}:`, err.message);
+		
+		// Kirim pesan error yang friendly
 		await msg.reply(
-			"Maaf, terjadi kesalahan. Silakan coba lagi dengan mengirim pesan apa saja untuk memulai ulang."
+			"Maaf, sepertinya ada gangguan sebentar. Bisa coba tanya lagi? 🙏"
 		);
 	}
 });
 
 // REST API Endpoints untuk testing dan debugging
 
-// Endpoint untuk testing chat API (seperti coba_chatbot)
+// Endpoint untuk testing chat API
 app.post("/api/chat", async (req, res) => {
 	const { message } = req.body;
 	if (!message) {
@@ -503,13 +471,24 @@ app.post("/api/chat", async (req, res) => {
 	}
 
 	try {
-		// Dapatkan konteks dari RAG
-		const contextualChunks = await getContextFromRAG(message);
+		// Decision: Apakah perlu RAG atau tidak?
+		const shouldUseRAG = needsRAG(message);
 
-		// Generate response menggunakan Gemini
-		const reply = await generateResponse(message, contextualChunks);
+		let reply;
 
-		res.json({ reply: reply });
+		if (shouldUseRAG) {
+			console.log(`🔍 API Chat: Menggunakan RAG untuk pertanyaan`);
+			const contextualChunks = await getContextFromRAG(message);
+			reply = await generateResponseWithRAG(message, contextualChunks);
+		} else {
+			console.log(`💬 API Chat: Menggunakan respons natural (tanpa RAG)`);
+			reply = await generateSimpleResponse(message);
+		}
+
+		res.json({ 
+			reply: reply,
+			usedRAG: shouldUseRAG
+		});
 	} catch (error) {
 		console.error("❌ Error di API chat:", error.message);
 		res.status(500).json({
@@ -851,5 +830,6 @@ app.listen(PORT, () => {
 	console.log(`💬 Chat API: http://localhost:${PORT}/api/chat`);
 	console.log(`📋 Send Ticket API: http://localhost:${PORT}/api/send-ticket`);
 	console.log(`📱 Menunggu koneksi WhatsApp...`);
-	console.log(`🔧 Untuk mengaktifkan chatbot, kirim pesan: /klinik_pemdi`);
+	console.log(`🤖 Chatbot siap! User bisa langsung chat apa saja - chatbot akan menjawab secara natural`);
+	console.log(`✨ Chatbot akan otomatis menentukan apakah perlu menggunakan RAG atau tidak`);
 });
