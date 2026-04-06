@@ -2,15 +2,16 @@ require("dotenv").config();
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
 const express = require("express");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
 const axios = require("axios");
 
 const app = express();
 app.use(express.json());
 
-// Initialize Gemini AI
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const MODEL_NAME = "gemini-1.5-flash";
+// ========================================
+// CONFIGURATION - THIN CLIENT ORCHESTRATOR
+// ========================================
+const BACKEND_URL = process.env.BACKEND_URL || "https://0f0b-34-16-150-20.ngrok-free.app";
+const RAG_SERVICE_URL = process.env.RAG_SERVICE_URL;
 
 // Authorized phone numbers
 const AUTHORIZED_NUMBERS = process.env.AUTHORIZED_NUMBERS
@@ -221,162 +222,75 @@ function isAuthorizedUser(phoneNumber) {
 }
 
 // ========================================
-// CLASSIFIER: Menentukan apakah perlu RAG atau tidak
+// BACKEND API CLIENT - THIN WRAPPER
 // ========================================
-function needsRAG(message) {
-	const lowerMessage = message.toLowerCase().trim();
 
-	// 1. Sapaan umum - TIDAK PERLU RAG
-	const greetings = [
-		'halo', 'hai', 'hello', 'hi', 'hey',
-		'selamat pagi', 'selamat siang', 'selamat sore', 'selamat malam',
-		'assalamualaikum', 'salam'
-	];
-	if (greetings.some(greeting => lowerMessage === greeting || lowerMessage.startsWith(greeting + ' '))) {
-		return false;
-	}
-
-	// 2. Pertanyaan tentang chatbot - TIDAK PERLU RAG
-	const aboutBotKeywords = [
-		'ini chatbot', 'chatbot ini', 'bot ini', 'kamu siapa',
-		'siapa kamu', 'kamu bot', 'apa fungsi', 'bisa apa',
-		'bagaimana cara', 'cara menggunakan', 'cara pakai'
-	];
-	if (aboutBotKeywords.some(keyword => lowerMessage.includes(keyword))) {
-		return false;
-	}
-
-	// 3. Small talk - TIDAK PERLU RAG
-	const smallTalkKeywords = [
-		'apa kabar', 'kabar', 'gimana kabar',
-		'terima kasih', 'makasih', 'thanks', 'thank you',
-		'ok', 'oke', 'baik', 'siap'
-	];
-	if (smallTalkKeywords.some(keyword => lowerMessage === keyword || lowerMessage.includes(keyword))) {
-		const shortMessages = ['ok', 'oke', 'baik', 'siap', 'ya', 'tidak'];
-		if (shortMessages.includes(lowerMessage)) {
-			return false;
-		}
-	}
-
-	// 4. Jika pesan sangat pendek (1-2 kata) dan bukan pertanyaan - TIDAK PERLU RAG
-	const words = lowerMessage.split(' ').filter(w => w.length > 0);
-	if (words.length <= 2 && !lowerMessage.includes('?')) {
-		return false;
-	}
-
-	// 5. Default: Gunakan RAG untuk pertanyaan lainnya
-	return true;
-}
-
-// ========================================
-// RESPONSE WITHOUT RAG: Jawaban natural tanpa RAG
-// ========================================
-async function generateSimpleResponse(message) {
+async function getDecision(message) {
 	try {
-		const lowerMessage = message.toLowerCase().trim();
+		console.log(`   → POST ${BACKEND_URL}/decision`);
+		
+		const response = await axios.post(`${BACKEND_URL}/decision`, {
+			message: message
+		}, {
+			headers: { 'Content-Type': 'application/json' }
+		});
 
-		// Deteksi jenis pesan dan beri respons yang sesuai
-		let systemPrompt = "";
-
-		// Sapaan
-		const greetings = ['halo', 'hai', 'hello', 'hi', 'hey', 'selamat pagi', 'selamat siang', 'selamat sore', 'selamat malam', 'assalamualaikum', 'salam'];
-		if (greetings.some(greeting => lowerMessage.startsWith(greeting))) {
-			systemPrompt = `Kamu adalah asisten ramah Klinik PEMDI. User menyapa kamu dengan "${message}". Balas sapaan dengan hangat dan tawarkan bantuan secara natural. Maksimal 2-3 kalimat. Gunakan 1 emoji yang sesuai. Jangan sebutkan bahwa kamu adalah AI atau bot.`;
-		}
-		// Pertanyaan tentang chatbot
-		else if (lowerMessage.includes('chatbot') || lowerMessage.includes('kamu siapa') || lowerMessage.includes('siapa kamu') || lowerMessage.includes('bot')) {
-			systemPrompt = `Kamu adalah asisten Klinik PEMDI yang membantu menjawab pertanyaan seputar layanan klinik. User bertanya "${message}". Jelaskan bahwa kamu siap membantu dengan informasi seputar Klinik PEMDI. Maksimal 3 kalimat. Gunakan 1 emoji. Jangan sebut kata AI, bot, atau teknologi sistem.`;
-		}
-		// Small talk
-		else if (lowerMessage.includes('apa kabar') || lowerMessage.includes('kabar')) {
-			systemPrompt = `User bertanya "${message}". Jawab dengan ramah dan tanyakan balik bagaimana kamu bisa membantu. Maksimal 2 kalimat. Gunakan 1 emoji. Santai dan natural.`;
-		}
-		// Terima kasih
-		else if (lowerMessage.includes('terima kasih') || lowerMessage.includes('makasih') || lowerMessage.includes('thanks')) {
-			systemPrompt = `User mengucapkan "${message}". Jawab dengan ramah bahwa kamu senang bisa membantu dan siap membantu lagi. Maksimal 2 kalimat. Gunakan 1 emoji.`;
-		}
-		// Default untuk pesan pendek lainnya
-		else {
-			systemPrompt = `Kamu adalah asisten Klinik PEMDI. User mengirim pesan "${message}". Jawab dengan ramah dan tawarkan bantuan jika mereka punya pertanyaan seputar Klinik PEMDI. Maksimal 2-3 kalimat. Gunakan 1 emoji. Santai dan natural.`;
+		if (response.data && response.data.decision) {
+			return response.data.decision;
 		}
 
-		const model = genAI.getGenerativeModel({ model: MODEL_NAME });
-		const result = await model.generateContent([systemPrompt]);
-		const response = await result.response;
-
-		return response.text();
+		throw new Error("Invalid response format from /decision");
 	} catch (error) {
-		console.error("❌ Error generating simple response:", error.message);
-		// Fallback response
-		return "Halo! Ada yang bisa saya bantu? 😊";
-	}
-}
-
-// ========================================
-// RAG SERVICE: Mendapatkan konteks dari RAG
-// ========================================
-async function getContextFromRAG(message) {
-	try {
-		const response = await axios.post(
-			`${process.env.RAG_SERVICE_URL}/admin/context/searchtest/`,
-			{
-				message: message,
-			}
-		);
-		return response.data.results;
-	} catch (error) {
-		console.error("❌ Error mengakses RAG service:", error.message);
-		return [];
-	}
-}
-
-// ========================================
-// RESPONSE WITH RAG: Generate response menggunakan Gemini + RAG
-// ========================================
-async function generateResponseWithRAG(message, contextualChunks) {
-	try {
-		// Jika tidak ada konteks dari RAG
-		if (!contextualChunks || contextualChunks.length === 0) {
-			const model = genAI.getGenerativeModel({ model: MODEL_NAME });
-			const fallbackPrompt = `Kamu adalah asisten ramah Klinik PEMDI. User bertanya "${message}" tapi kamu tidak memiliki informasi spesifik tentang itu. Jawab dengan sopan bahwa informasi tersebut belum tersedia dan tawarkan bantuan untuk pertanyaan lain. Maksimal 3 kalimat. Gunakan 1 emoji. Jangan sebut kata "sistem", "database", atau "RAG".`;
-			const result = await model.generateContent([fallbackPrompt]);
-			const response = await result.response;
-			return response.text();
-		}
-
-		const combinedContext = contextualChunks.join("\n\n---\n\n");
-
-		const prompt = `Kamu adalah asisten ramah Klinik PEMDI yang membantu menjawab pertanyaan pengguna.
-
-**ATURAN PENTING:**
-1. Jawab dengan gaya NATURAL dan RAMAH seperti customer service yang berpengalaman
-2. Gunakan informasi dari konteks di bawah untuk menjawab
-3. Jika informasi tidak ada di konteks, katakan dengan jujur tapi tetap sopan
-4. Maksimal 5-6 kalimat (kecuali perlu penjelasan detail)
-5. Boleh gunakan 1-2 emoji yang sesuai
-6. JANGAN sebut: "berdasarkan dokumen", "sistem internal", "database", "RAG", "AI", "model bahasa"
-7. Gunakan kata ganti "kami" atau "Klinik PEMDI" untuk merujuk layanan
-8. Bahasa Indonesia yang santai tapi profesional
-
-=== Informasi yang Tersedia ===
-${combinedContext}
-================================
-
-Pertanyaan User:
-${message}
-
-Jawab dengan natural dan membantu:`;
-
-		const model = genAI.getGenerativeModel({ model: MODEL_NAME });
-		const result = await model.generateContent([prompt]);
-		const response = await result.response;
-
-		return response.text();
-	} catch (error) {
-		console.error("❌ Error generating response with RAG:", error.message);
+		console.error(`   ❌ /decision error:`, error.message);
 		throw error;
 	}
+}
+
+async function generateResponse(message, mode, context = null) {
+	try {
+		console.log(`   → POST ${BACKEND_URL}/generate (mode=${mode})`);
+		
+		const requestBody = {
+			message: message,
+			mode: mode
+		};		
+		if (mode === "RAG" && context) {
+			requestBody.context = context;
+		}
+
+		const response = await axios.post(`${BACKEND_URL}/generate`, requestBody, {
+			headers: { 'Content-Type': 'application/json' }
+		});
+
+		if (response.data && response.data.reply) {
+			return response.data.reply;
+		}
+
+		throw new Error("Invalid response format from /generate");
+	} catch (error) {
+		console.error(`   ❌ /generate error:`, error.message);
+		throw error;
+	}
+}
+
+async function getContextFromRAG(message) {
+    try {
+        console.log(`   → Fetching context from RAG service...`);
+        const response = await axios.post(
+            `${RAG_SERVICE_URL}/admin/context/search/`,
+            { query: message }
+        );
+        
+        if (response.data && response.data.results) {
+            console.log(`   → Found ${response.data.results.length} context chunks`);
+            return response.data.results.map(item => item.content);
+        }
+        
+        return [];
+    } catch (error) {
+        console.error(`   ❌ RAG service error:`, error.message);
+        return [];
+    }
 }
 
 // ========================================
@@ -411,32 +325,32 @@ client.on("message", async (msg) => {
 
 	try {
 		// ========================================
-		// DECISION: Apakah perlu RAG atau tidak?
+		// STEP 1: DECISION ROUTING (Backend)
 		// ========================================
-		const shouldUseRAG = needsRAG(incomingText);
+		console.log(`🧠 Step 1: Mengklasifikasi intent untuk ${sender}`);
+		const decision = await getDecision(incomingText);
+		console.log(`📍 Decision Result: ${decision}`);
 
-		let reply;
-
-		if (shouldUseRAG) {
-			// ========================================
-			// PATH 1: Pertanyaan DENGAN RAG
-			// ========================================
-			console.log(`🔍 Menggunakan RAG untuk pertanyaan dari ${sender}`);
-			
-			// Dapatkan konteks dari RAG
-			const contextualChunks = await getContextFromRAG(incomingText);
-			
-			// Generate response dengan RAG
-			reply = await generateResponseWithRAG(incomingText, contextualChunks);
+		let context = null;
+		
+		// ========================================
+		// STEP 2: RAG CONTEXT RETRIEVAL (if needed)
+		// ========================================
+		if (decision === "RAG") {
+			console.log(`🔍 Step 2: Mengambil Konteks RAG`);
+			context = await getContextFromRAG(incomingText);
+			if (!context || context.length === 0) {
+				console.log(`   ⚠️  No context found, backend will handle gracefully`);
+			}
 		} else {
-			// ========================================
-			// PATH 2: Pertanyaan TANPA RAG
-			// ========================================
-			console.log(`💬 Menggunakan respons natural (tanpa RAG) untuk ${sender}`);
-			
-			// Generate response natural tanpa RAG
-			reply = await generateSimpleResponse(incomingText);
+			console.log(`💬 Step 2: Skipped (${decision} mode doesn't need RAG)`);
 		}
+		
+		// ========================================
+		// STEP 3: RESPONSE GENERATION (Backend)
+		// ========================================
+		console.log(`✨ Step 3: Menghasilkan Response (mode=${decision})`);
+		const reply = await generateResponse(incomingText, decision, context);
 
 		// Kirim balasan
 		await msg.reply(reply);
@@ -471,23 +385,28 @@ app.post("/api/chat", async (req, res) => {
 	}
 
 	try {
-		// Decision: Apakah perlu RAG atau tidak?
-		const shouldUseRAG = needsRAG(message);
+		// ========================================
+		// STEP 1 & 2: DECISION & CONTEXT
+		// ========================================
+		const decision = await getDecision(message);
+		let context = null;
 
-		let reply;
-
-		if (shouldUseRAG) {
-			console.log(`🔍 API Chat: Menggunakan RAG untuk pertanyaan`);
-			const contextualChunks = await getContextFromRAG(message);
-			reply = await generateResponseWithRAG(message, contextualChunks);
+		if (decision === "RAG") {
+			console.log(`🔍 API Chat: Fetching RAG context`);
+			context = await getContextFromRAG(message);
 		} else {
-			console.log(`💬 API Chat: Menggunakan respons natural (tanpa RAG)`);
-			reply = await generateSimpleResponse(message);
+			console.log(`💬 API Chat: Skipping RAG (${decision})`);
 		}
+
+		// ========================================
+		// STEP 3: GENERATE RESPONSE
+		// ========================================
+		console.log(`✨ API Chat: Generating Response (mode=${decision})`);
+		const reply = await generateResponse(message, decision, context);
 
 		res.json({ 
 			reply: reply,
-			usedRAG: shouldUseRAG
+			mode: decision
 		});
 	} catch (error) {
 		console.error("❌ Error di API chat:", error.message);
