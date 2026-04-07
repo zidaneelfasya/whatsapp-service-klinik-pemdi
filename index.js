@@ -536,6 +536,43 @@ app.post("/initialize", (req, res) => {
 	}
 });
 
+// Endpoint untuk stop initialization / disconnect paksa di tengah jalan
+app.post("/stop-initialize", async (req, res) => {
+	console.log("🛑 Memaksa stop initialization...");
+	
+	try {
+		isInitializing = false;
+		
+		// Reset status
+		whatsappStatus.status = 'DISCONNECTED';
+		whatsappStatus.qrCode = null;
+		whatsappStatus.loadingPercent = 0;
+		whatsappStatus.loadingMessage = '';
+		whatsappStatus.error = "Dibatalkan oleh user";
+		
+		// Coba destroy client jika ada proses yang berjalan
+		if (client && client.pupBrowser) {
+			try {
+				await client.destroy();
+			} catch (err) {
+				console.log("⚠️ Mengabaikan error saat destroy browser:", err.message);
+			}
+		}
+
+		res.json({
+			success: true,
+			message: "Proses initialization berhasil dihentikan"
+		});
+
+	} catch (error) {
+		console.error("❌ Error saat mencoba stop initialization:", error);
+		res.status(500).json({
+			success: false,
+			error: error.message
+		});
+	}
+});
+
 // Endpoint untuk disconnect WhatsApp
 app.post("/disconnect", async (req, res) => {
 	try {
