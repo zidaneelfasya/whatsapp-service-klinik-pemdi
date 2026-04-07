@@ -7,11 +7,8 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
-// ========================================
-// CONFIGURATION - THIN CLIENT ORCHESTRATOR
-// ========================================
-const BACKEND_URL = process.env.BACKEND_URL || "https://0f0b-34-16-150-20.ngrok-free.app";
-const RAG_SERVICE_URL = process.env.RAG_SERVICE_URL;
+// Initialize Backend URL
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
 
 // Authorized phone numbers
 const AUTHORIZED_NUMBERS = process.env.AUTHORIZED_NUMBERS
@@ -48,6 +45,7 @@ const client = new Client({
 	}),
 	puppeteer: {
 		headless: true,
+		executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
 		args: [
 			"--no-sandbox",
 			"--disable-setuid-sandbox",
@@ -185,8 +183,6 @@ if (process.env.AUTO_INIT_WHATSAPP === 'true') {
 	console.log("⏸️ WhatsApp Client ready for manual initialization via /initialize endpoint");
 	console.log("💡 Use POST /initialize to start WhatsApp connection");
 }
-// Simple conversation tracking (optional, untuk fitur lanjutan seperti context memory)
-const userSessions = new Map();
 
 // Fungsi untuk cek apakah nomor diotorisasi
 function isAuthorizedUser(phoneNumber) {
@@ -221,14 +217,9 @@ function isAuthorizedUser(phoneNumber) {
 	return isAuthorized;
 }
 
-// ========================================
-// BACKEND API CLIENT - THIN WRAPPER
-// ========================================
-
+// Fungsi untuk mendapatkan keputusan jenis respons dari backend
 async function getDecision(message) {
 	try {
-		console.log(`   → POST ${BACKEND_URL}/decision`);
-		
 		const response = await axios.post(`${BACKEND_URL}/decision`, {
 			message: message
 		}, {
@@ -240,20 +231,40 @@ async function getDecision(message) {
 		}
 
 		throw new Error("Invalid response format from /decision");
+
 	} catch (error) {
-		console.error(`   ❌ /decision error:`, error.message);
+		console.error("❌ Error classification intent:", error.message);
 		throw error;
 	}
 }
 
+// Fungsi untuk mendapatkan konteks dari RAG service
+async function getContextFromRAG(message) {
+	try {
+		const response = await axios.post(
+			`${process.env.RAG_SERVICE_URL}/admin/context/search/`,
+			{
+				query: message,
+			}
+		);
+		if (response.data && response.data.results) {
+			return response.data.results.map(item => item.content);
+		}
+		return [];
+	} catch (error) {
+		console.error("❌ Error mengakses RAG service:", error.message);
+		return [];
+	}
+}
+
+// Fungsi untuk generate response menggunakan FastAPI backend
 async function generateResponse(message, mode, context = null) {
 	try {
-		console.log(`   → POST ${BACKEND_URL}/generate (mode=${mode})`);
-		
 		const requestBody = {
 			message: message,
 			mode: mode
-		};		
+		};
+		
 		if (mode === "RAG" && context) {
 			requestBody.context = context;
 		}
@@ -267,154 +278,78 @@ async function generateResponse(message, mode, context = null) {
 		}
 
 		throw new Error("Invalid response format from /generate");
+
 	} catch (error) {
-		console.error(`   ❌ /generate error:`, error.message);
+		console.error("❌ Error generating response:", error.message);
 		throw error;
 	}
 }
 
-async function getContextFromRAG(message) {
-    try {
-        console.log(`   → Fetching context from RAG service...`);
-        const response = await axios.post(
-            `${RAG_SERVICE_URL}/admin/context/search/`,
-            { query: message }
-        );
-        
-        if (response.data && response.data.results) {
-            console.log(`   → Found ${response.data.results.length} context chunks`);
-            return response.data.results.map(item => item.content);
-        }
-        
-        return [];
-    } catch (error) {
-        console.error(`   ❌ RAG service error:`, error.message);
-        return [];
-    }
+// Handler pesan WhatsApp
+client.on("message", async (msg) => {
+const incomingText = msg.body.trim();
+const sender = msg.from;
+
+console.log(`📩 Pesan masuk dari ${sender}: ${incomingText}`);
+
+// 🔐 AUTHORIZATION CHECK - Cek apakah user diotorisasi
+if (!isAuthorizedUser(sender)) {
+console.log(
+`🚫 Akses ditolak untuk ${sender} - Tidak dalam daftar authorized users`
+);
+// Tidak mengirim balasan apapun, hanya log dan return
+return;
 }
 
-// ========================================
-// HANDLER PESAN WHATSAPP - INTERACTIVE & NATURAL
-// ========================================
-client.on("message", async (msg) => {
-	const incomingText = msg.body.trim();
-	const sender = msg.from;
+try {
+// Dapatkan keputusan dari backend
+const decision = await getDecision(incomingText);
+let context = null;
 
-	console.log(`📩 Pesan masuk dari ${sender}: ${incomingText}`);
+// Dapatkan konteks dari RAG jika diperlukan
+if (decision === "RAG") {
+context = await getContextFromRAG(incomingText);
+}
 
-	// 🔐 AUTHORIZATION CHECK
-	if (!isAuthorizedUser(sender)) {
-		console.log(
-			`🚫 Akses ditolak untuk ${sender} - Tidak dalam daftar authorized users`
-		);
-		return;
-	}
+// Generate response
+const reply = await generateResponse(incomingText, decision, context);
 
-	// Abaikan pesan grup dan pesan dari bot sendiri
-	if (msg.from.includes('@g.us')) {
-		console.log(`⚪ Pesan grup diabaikan dari ${sender}`);
-		return;
-	}
-
-	// Abaikan pesan yang terlalu panjang (kemungkinan spam)
-	if (incomingText.length > 1000) {
-		console.log(`⚠️ Pesan terlalu panjang dari ${sender}`);
-		await msg.reply("Maaf, pesan Anda terlalu panjang. Bisa dipersingkat? 😊");
-		return;
-	}
-
-	try {
-		// ========================================
-		// STEP 1: DECISION ROUTING (Backend)
-		// ========================================
-		console.log(`🧠 Step 1: Mengklasifikasi intent untuk ${sender}`);
-		const decision = await getDecision(incomingText);
-		console.log(`📍 Decision Result: ${decision}`);
-
-		let context = null;
-		
-		// ========================================
-		// STEP 2: RAG CONTEXT RETRIEVAL (if needed)
-		// ========================================
-		if (decision === "RAG") {
-			console.log(`🔍 Step 2: Mengambil Konteks RAG`);
-			context = await getContextFromRAG(incomingText);
-			if (!context || context.length === 0) {
-				console.log(`   ⚠️  No context found, backend will handle gracefully`);
-			}
-		} else {
-			console.log(`💬 Step 2: Skipped (${decision} mode doesn't need RAG)`);
-		}
-		
-		// ========================================
-		// STEP 3: RESPONSE GENERATION (Backend)
-		// ========================================
-		console.log(`✨ Step 3: Menghasilkan Response (mode=${decision})`);
-		const reply = await generateResponse(incomingText, decision, context);
-
-		// Kirim balasan
-		await msg.reply(reply);
-		console.log(`✅ Balasan terkirim ke ${sender}`);
-
-		// Optional: Track conversation (untuk fitur lanjutan seperti context memory)
-		if (!userSessions.has(sender)) {
-			userSessions.set(sender, { messageCount: 0, lastMessageTime: Date.now() });
-		}
-		const session = userSessions.get(sender);
-		session.messageCount++;
-		session.lastMessageTime = Date.now();
-		userSessions.set(sender, session);
-
-	} catch (err) {
-		console.error(`❌ Gagal memproses pesan dari ${sender}:`, err.message);
-		
-		// Kirim pesan error yang friendly
-		await msg.reply(
-			"Maaf, sepertinya ada gangguan sebentar. Bisa coba tanya lagi? 🙏"
-		);
-	}
+await msg.reply(reply);
+} catch (err) {
+console.error(`❌ Gagal memproses pesan dari ${sender}`, err.message);
+await msg.reply(
+"Maaf, layanan chatbot sedang tidak tersedia saat ini. 😔\n\nSilakan:\n• Coba lagi beberapa saat\n• Atau kunjungi: http://klinikpemdig.layanan.go.id/konsultasi-form\n\nTim kami akan segera membantu Anda! 🙏"
+);
+}
 });
 
 // REST API Endpoints untuk testing dan debugging
 
-// Endpoint untuk testing chat API
+// Endpoint untuk testing chat API (seperti coba_chatbot)
 app.post("/api/chat", async (req, res) => {
-	const { message } = req.body;
-	if (!message) {
-		return res.status(400).json({ error: "Message is required" });
-	}
+const { message } = req.body;
+if (!message) {
+return res.status(400).json({ error: "Message is required" });
+}
 
-	try {
-		// ========================================
-		// STEP 1 & 2: DECISION & CONTEXT
-		// ========================================
-		const decision = await getDecision(message);
-		let context = null;
+try {
+        const decision = await getDecision(message);
+        let context = null;
 
-		if (decision === "RAG") {
-			console.log(`🔍 API Chat: Fetching RAG context`);
-			context = await getContextFromRAG(message);
-		} else {
-			console.log(`💬 API Chat: Skipping RAG (${decision})`);
-		}
+        if (decision === "RAG") {
+            context = await getContextFromRAG(message);
+        }
 
-		// ========================================
-		// STEP 3: GENERATE RESPONSE
-		// ========================================
-		console.log(`✨ API Chat: Generating Response (mode=${decision})`);
-		const reply = await generateResponse(message, decision, context);
+        const reply = await generateResponse(message, decision, context);
 
-		res.json({ 
-			reply: reply,
-			mode: decision
-		});
-	} catch (error) {
-		console.error("❌ Error di API chat:", error.message);
-		res.status(500).json({
-			error: "Internal server error",
-			details: error.message,
-		});
-	}
+res.json({ reply: reply, decision: decision });
+} catch (error) {
+console.error("❌ Error di API chat:", error.message);
+res.status(500).json({
+error: "Internal server error",
+details: error.message,
+});
+}
 });
 
 // Endpoint untuk mendapatkan konteks saja
@@ -564,26 +499,6 @@ Terima kasih! 🙏`;
 			error: "Failed to send ticket",
 			details: err.message,
 		});
-	}
-});
-
-// Endpoint untuk cek status session (debugging)
-app.get("/sessions", (req, res) => {
-	const sessions = {};
-	userSessions.forEach((value, key) => {
-		sessions[key] = value;
-	});
-	res.json(sessions);
-});
-
-// Endpoint untuk reset session tertentu (debugging)
-app.post("/reset-session", (req, res) => {
-	const { sender } = req.body;
-	if (userSessions.has(sender)) {
-		userSessions.set(sender, { status: CHAT_STATUS.INACTIVE });
-		res.json({ success: true, message: `Session reset untuk ${sender}` });
-	} else {
-		res.json({ success: false, message: "Session tidak ditemukan" });
 	}
 });
 
@@ -749,6 +664,5 @@ app.listen(PORT, () => {
 	console.log(`💬 Chat API: http://localhost:${PORT}/api/chat`);
 	console.log(`📋 Send Ticket API: http://localhost:${PORT}/api/send-ticket`);
 	console.log(`📱 Menunggu koneksi WhatsApp...`);
-	console.log(`🤖 Chatbot siap! User bisa langsung chat apa saja - chatbot akan menjawab secara natural`);
-	console.log(`✨ Chatbot akan otomatis menentukan apakah perlu menggunakan RAG atau tidak`);
+	console.log(`🔧 Untuk mengaktifkan chatbot, kirim pesan: /klinik_pemdi`);
 });
