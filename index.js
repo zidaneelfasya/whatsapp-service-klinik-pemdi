@@ -1,8 +1,10 @@
 require("dotenv").config();
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, NoAuth } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(express.json());
@@ -38,31 +40,35 @@ let whatsappStatus = {
 
 let isInitializing = false;
 
-// Initialize WhatsApp Client dengan LocalAuth untuk menyimpan session
+// Initialize WhatsApp Client dengan NoAuth (tanpa menyimpan session)
 const client = new Client({
-	authStrategy: new LocalAuth({
-		clientId: "whatsapp-chatbot-unified",
-	}),
+	authStrategy: new NoAuth(),
 	puppeteer: {
 		headless: true,
-		executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
 		args: [
 			"--no-sandbox",
 			"--disable-setuid-sandbox",
 			"--disable-dev-shm-usage",
 			"--disable-accelerated-2d-canvas",
-			"--no-first-run",
-			"--no-zygote",
-			"--single-process",
 			"--disable-gpu",
+			"--no-zygote"
 		],
+		defaultViewport: {
+			width: 1280,
+			height: 800
+		}
 	},
+	userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+	webVersionCache: { type: 'none' }, // hindari cache versi web yang bisa menyebabkan loop
+	authTimeoutMs: 60000,
+	takeoverOnConflict: true,
+  takeoverTimeoutMs: 0,
 });
 
 // QR Code untuk WhatsApp
 client.on("qr", (qr) => {
 	console.log("📱 QR Code generated for WhatsApp connection");
-	console.log("⏰ QR Code akan expire dalam 20 detik...");
+	console.log("⏰ QR Code akan expire dalam 60 detik...");
 	
 	// Generate QR code as data URL for frontend
 	const QRCode = require('qrcode');
@@ -78,13 +84,13 @@ client.on("qr", (qr) => {
 	whatsappStatus.status = 'QR_READY';
 	whatsappStatus.error = null;
 	
-	// Auto-expire QR code after 20 seconds
+	// Auto-expire QR code after 60 seconds
 	setTimeout(() => {
 		if (whatsappStatus.status === 'QR_READY') {
 			console.log("⏰ QR Code expired, generating new one...");
 			whatsappStatus.qrCode = null;
 		}
-	}, 20000);
+	}, 60000);
 	
 	// Display QR in terminal too
 	qrcode.generate(qr, { small: true });
@@ -100,8 +106,7 @@ client.on("loading_screen", (percent, message) => {
 
 // Event ketika authenticating
 client.on("authenticated", (session) => {
-	console.log("✅ WhatsApp berhasil terotentikasi!");
-	console.log("💾 Session tersimpan untuk penggunaan selanjutnya");
+	console.log("✅ WhatsApp berhasil terotentikasi (Sistem NoAuth aktif)!");
 	whatsappStatus.status = 'AUTHENTICATING';
 	whatsappStatus.error = null;
 });
@@ -116,37 +121,24 @@ client.on("auth_failure", (msg) => {
 });
 
 // Event ketika client ready
-client.on("ready", () => {
+client.on("ready", async () => {
 	console.log("✅ WhatsApp Client siap digunakan!");
 	console.log("📱 Bot telah terhubung dan siap menerima pesan");
 
-	// Update status to connected
-	whatsappStatus.status = 'CONNECTED';
+	whatsappStatus.status = "CONNECTED";
 	whatsappStatus.qrCode = null;
 	whatsappStatus.error = null;
 	whatsappStatus.loadingPercent = 100;
-	whatsappStatus.loadingMessage = 'Connected successfully';
-	
-	// Get client info
-	client.info.then((info) => {
-		whatsappStatus.info = info;
-		console.log("📊 Client info:", info);
-	});
+	whatsappStatus.loadingMessage = "Connected successfully";
 
-	// Log info client
-	client.getState().then((state) => {
+	try {
+		whatsappStatus.info = client.info;
+		console.log("📊 Client info:", client.info);
+
+		const state = await client.getState();
 		console.log("📊 Status koneksi:", state);
-	});
-
-	// Test dengan mengirim pesan ke diri sendiri (opsional)
-	if (process.env.TEST_NUMBER) {
-		client
-			.sendMessage(
-				`${process.env.TEST_NUMBER}@c.us`,
-				"🤖 Bot telah aktif dan siap melayani!"
-			)
-			.then(() => console.log("✅ Test message sent"))
-			.catch((err) => console.log("⚠️ Test message failed:", err.message));
+	} catch (err) {
+		console.error("❌ Error after ready:", err.message);
 	}
 });
 
@@ -181,14 +173,17 @@ function isAuthorizedUser(phoneNumber) {
 		return true;
 	}
 
-	// Ekstrak nomor dari format WhatsApp (contoh: 6282123129426@c.us)
-	const cleanNumber = phoneNumber.replace("@c.us", "").replace("@g.us", "");
+	// Ekstrak nomor dari format WhatsApp (contoh: 6282123129426@c.us atau format @lid)
+	const cleanNumber = phoneNumber.replace("@c.us", "").replace("@g.us", "").replace("@lid", "");
 
 	// Cek apakah nomor ada di daftar authorized
 	const isAuthorized = AUTHORIZED_NUMBERS.some((authNum) => {
 		// Hapus karakter non-digit untuk perbandingan yang lebih fleksibel
 		const cleanAuthNum = authNum.replace(/\D/g, "");
 		const cleanIncomingNum = cleanNumber.replace(/\D/g, "");
+
+		// Mencegah bug string kosong (seperti "status@broadcast" jika lolos) yang akan me-return true
+		if (!cleanIncomingNum || !cleanAuthNum) return false;
 
 		return (
 			cleanIncomingNum.includes(cleanAuthNum) ||
@@ -275,9 +270,24 @@ async function generateResponse(message, mode, context = null) {
 // Handler pesan WhatsApp
 client.on("message", async (msg) => {
 const incomingText = msg.body.trim();
-const sender = msg.from;
+const senderOriginal = msg.from;
 
-console.log(`📩 Pesan masuk dari ${sender}: ${incomingText}`);
+// Abaikan jika pesan berbentuk status/story
+if (senderOriginal === "status@broadcast") return;
+
+let sender = senderOriginal;
+try {
+	// Terkadang sender ID dikirim dalam format LID (Linked Devices / Meta id).
+	// Kita bisa mengambil detail contact untuk mendapatkan nomor HP yang sebenarnya.
+	const contact = await msg.getContact();
+	if (contact && contact.number) {
+		sender = contact.number;
+	}
+} catch (e) {
+	console.log("⚠️ Gagal mengekstrak contact number dari WA:", e.message);
+}
+
+console.log(`📩 Pesan masuk dari Asli: ${senderOriginal}, Nomor HP: ${sender} -> Teks: ${incomingText}`);
 
 // 🔐 AUTHORIZATION CHECK - Cek apakah user diotorisasi
 if (!isAuthorizedUser(sender)) {
@@ -490,7 +500,7 @@ Terima kasih! 🙏`;
 });
 
 // Endpoint untuk initialize WhatsApp connection
-app.post("/initialize", (req, res) => {
+app.post("/initialize", async (req, res) => {
 	if (isInitializing) {
 		return res.json({
 			success: false,
@@ -512,17 +522,24 @@ app.post("/initialize", (req, res) => {
 		whatsappStatus.error = null;
 		whatsappStatus.qrCode = null;
 		
-		client.initialize();
+		await client.initialize().catch((err) => {
+			console.error("❌ Error tertangkap saat initialize (auth timeout/crash):", err.message);
+			whatsappStatus.status = 'ERROR';
+			whatsappStatus.error = err.message;
+			isInitializing = false;
+		});
 		
 		// Reset initializing flag after timeout
 		setTimeout(() => {
 			isInitializing = false;
 		}, 60000);
 
-		res.json({
-			success: true,
-			message: "WhatsApp initialization started"
-		});
+		if (!res.headersSent) {
+			res.json({
+				success: true,
+				message: "WhatsApp initialization started"
+			});
+		}
 	} catch (error) {
 		console.error("❌ Error initializing WhatsApp:", error);
 		isInitializing = false;
@@ -619,6 +636,73 @@ app.post("/disconnect", async (req, res) => {
 		res.json({
 			success: true,
 			message: "WhatsApp disconnected (with errors)",
+			error: error.message
+		});
+	}
+});
+
+// Endpoint untuk reset seluruh session (logout dan hapus data)
+app.post("/reset-session", async (req, res) => {
+	console.log("🛑 Memaksa hapus seluruh session...");
+	
+	try {
+		// 1. Force disconnect jika sedang terhubung
+		if (client && client.pupBrowser) {
+			try {
+				await client.logout(); // Coba logout secara graceful terlebih dahulu
+				await client.destroy(); // Kemudian destroy instance-nya
+			} catch (err) {
+				console.log("⚠️ Mengabaikan error saat logout/destroy:", err.message);
+			}
+		}
+
+		// 2. Reset Status Server
+		isInitializing = false;
+		whatsappStatus.status = 'DISCONNECTED';
+		whatsappStatus.qrCode = null;
+		whatsappStatus.info = null;
+		whatsappStatus.error = null;
+		whatsappStatus.loadingPercent = 0;
+		whatsappStatus.loadingMessage = '';
+
+		// 3. Hapus Folder Session (.wwebjs_auth)
+		const sessionDir = path.join(__dirname, '.wwebjs_auth');
+		const cacheDir = path.join(__dirname, '.wwebjs_cache');
+		let folderDeleted = false;
+
+		if (fs.existsSync(sessionDir)) {
+			try {
+				fs.rmSync(sessionDir, { recursive: true, force: true });
+				console.log("🗑️  Folder session (LocalAuth) berhasil dihapus");
+				folderDeleted = true;
+			} catch (err) {
+				console.error("❌ Gagal menghapus folder session:", err.message);
+				throw new Error("Gagal menghapus file session: " + err.message);
+			}
+		} else {
+			console.log("ℹ️ Folder session tidak ditemukan (sudah bersih)");
+			folderDeleted = true;
+		}
+
+		if (fs.existsSync(cacheDir)) {
+			try {
+				fs.rmSync(cacheDir, { recursive: true, force: true });
+				console.log("🗑️  Folder cache (.wwebjs_cache) berhasil dihapus");
+			} catch (err) {
+				console.log("⚠️ Gagal menghapus folder cache:", err.message);
+			}
+		}
+
+		res.json({
+			success: true,
+			message: "Semua session berhasil direset persisten",
+			folderDeleted: folderDeleted
+		});
+
+	} catch (error) {
+		console.error("❌ Error mereset session:", error);
+		res.status(500).json({
+			success: false,
 			error: error.message
 		});
 	}
