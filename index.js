@@ -167,22 +167,9 @@ client.on("error", (error) => {
 	whatsappStatus.error = error.message || 'Unknown error occurred';
 });
 
-// Timeout untuk initialization
-// Optional: Auto-initialize if environment variable is set
-if (process.env.AUTO_INIT_WHATSAPP === 'true') {
-	console.log("🚀 Auto-initializing WhatsApp Client...");
-	isInitializing = true;
-	whatsappStatus.status = 'CONNECTING';
-	client.initialize();
-	
-	// Reset initializing flag after timeout
-	setTimeout(() => {
-		isInitializing = false;
-	}, 60000);
-} else {
-	console.log("⏸️ WhatsApp Client ready for manual initialization via /initialize endpoint");
-	console.log("💡 Use POST /initialize to start WhatsApp connection");
-}
+// Status awal: Client standby menunggu perintah dari API
+console.log("⏸️ WhatsApp Client ready for manual initialization via /initialize endpoint");
+console.log("💡 Use POST /initialize to start WhatsApp connection");
 
 // Fungsi untuk cek apakah nomor diotorisasi
 function isAuthorizedUser(phoneNumber) {
