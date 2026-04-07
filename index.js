@@ -45,6 +45,7 @@ const client = new Client({
 	authStrategy: new NoAuth(),
 	puppeteer: {
 		headless: true,
+		executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
 		args: [
 			"--no-sandbox",
 			"--disable-setuid-sandbox",
@@ -766,7 +767,7 @@ app.post("/add-authorized-user", (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
 	console.log(`🚀 Server berjalan di port ${PORT}`);
 	console.log(`📊 Health check: http://localhost:${PORT}/health`);
 	console.log(`💬 Chat API: http://localhost:${PORT}/api/chat`);
