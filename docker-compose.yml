@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  whatsapp-bot:
+    image: zidaneelfasya/wa-service-kpdig:latest
+    container_name: whatsapp-bot-klinik
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:5000:5000"
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          memory: 1G

@@ -52,7 +52,7 @@ const client = new Client({
 			"--disable-dev-shm-usage",
 			"--disable-accelerated-2d-canvas",
 			"--disable-gpu",
-			"--no-zygote"
+			"--disable-software-rasterizer"
 		],
 		defaultViewport: {
 			width: 1280,
